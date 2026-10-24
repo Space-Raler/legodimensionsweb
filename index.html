@@ -71,6 +71,9 @@ dialog pre.info{white-space:pre-wrap;font-size:12px;color:var(--muted);margin:8p
 .tabs{display:flex;gap:8px;margin-bottom:8px}
 .tabs button{flex:1}
 .tag{font-size:11px;color:var(--muted)}
+.row .acts{display:flex;gap:2px;flex:none}
+.row .acts button{background:transparent;padding:6px 8px;min-height:36px;color:var(--muted)}
+.row.veh .thumb{background:#c4602a}
 </style>
 </head>
 <body>
@@ -97,14 +100,28 @@ dialog pre.info{white-space:pre-wrap;font-size:12px;color:var(--muted);margin:8p
   <div class="tabs"><button id="tabMini" class="on">Minifigures</button><button id="tabVeh">Vehicles</button><button id="tabFav">Favorites</button></div>
   <input type="search" id="q" placeholder="Search">
   <div class="list" id="list"></div>
-  <p class="hint">Only the Flipper's own character and vehicle list can be placed. Nothing is stored on the Flipper by this page; favorites stay in this browser.</p>
+  <p class="hint">Only the Flipper's own character and vehicle list can be placed. Characters have no memory to keep; vehicles do (see Saved vehicles below). Favorites stay in this browser.</p>
+</section>
+
+<section id="lib">
+  <h2>Saved vehicles</h2>
+  <div class="bar">
+    <button id="bSaveSel" disabled>Save selected spot</button>
+    <button id="bToFlip" disabled>Save on Flipper</button>
+    <button id="bFromFlip" disabled>Import from Flipper</button>
+  </div>
+  <label class="chk"><input type="checkbox" id="autoKeep" checked> Remember upgrades automatically when the game changes a vehicle</label>
+  <div class="list" id="libList"></div>
+  <div class="bar"><button id="bExport">Export</button><button id="bImport">Import file</button><input type="file" id="fImport" accept=".json,application/json"></div>
+  <p class="hint">A vehicle keeps its upgrades in its own memory. While a vehicle is on the pad this page asks the Flipper for that memory and keeps a copy here (in this browser's own database, not uploaded). Tap a saved vehicle to put it back exactly as it was. Clearing site data erases the copies, so tap Export now and then.</p>
 </section>
 
 <section><h2>Log</h2><div id="log"></div></section>
 <script>
 /* ===== CORE (no DOM): protocol, session, transport ===== */
 const VERSION = 3, SOF = 0xA5, MAX_PAYLOAD = 1 + 1024, BOXES = 7;
-const MSG = { HELLO: 1, REMOVE: 3, CLEAR: 4, STATUS_REQ: 5, LD_PLACE: 0x0C, STATUS: 0x81, RESULT: 0x82 };
+const MSG = { HELLO: 1, REMOVE: 3, CLEAR: 4, STATUS_REQ: 5, LD_PLACE: 0x0C, PLACE_VEHICLE: 0x0D, GET: 0x0E, SAVED_LIST: 0x0F, SAVED_READ: 0x10, SAVE_VEHICLE: 0x11, STATUS: 0x81, RESULT: 0x82, TOKEN: 0x86, SAVED_ITEM: 0x87 };
+const UID_SIZE = 7, DATA_SIZE = 180, BOX_FILE = 0xFF;
 const KIND = { EMPTY: 0, MINIFIG: 1, VEHICLE: 2 };
 const RESULT_TEXT = { 0: "ok", 1: "no such spot", 2: "bad length", 3: "that character or vehicle is not known to the Flipper", 4: "the Flipper refused it (no free token slot, or bad request)", 5: "not ready: plug the Flipper into the console, then open Emulate on the Flipper" };
 const USB_TEXT = { 0: "Flipper is not connected to a console", 1: "console connected, toy pad ready", 2: "console connected: open the Emulate screen on the Flipper" };
@@ -169,7 +186,17 @@ const P = {
   },
   remove: (box) => encode(MSG.REMOVE, Uint8Array.of(box)),
   clear: () => encode(MSG.CLEAR),
+  placeVehicle(box, uid, data) { const p = new Uint8Array(1 + UID_SIZE + DATA_SIZE); p[0] = box; p.set(uid, 1); p.set(data, 1 + UID_SIZE); return encode(MSG.PLACE_VEHICLE, p); },
+  get: (box) => encode(MSG.GET, Uint8Array.of(box)),
+  savedList: () => encode(MSG.SAVED_LIST),
+  savedRead: (name) => encode(MSG.SAVED_READ, new TextEncoder().encode(name)),
+  saveVehicle: (box) => encode(MSG.SAVE_VEHICLE, Uint8Array.of(box)),
 };
+/* Vehicle memory helpers. The upgrades are two 32-bit words in the token data; the id is at 0x24*4. */
+const hexOf = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join("");
+const unhex = (h) => Uint8Array.from(h.match(/../g) || [], (x) => parseInt(x, 16));
+const vehIdOf = (d) => d[0x24 * 4] | (d[0x24 * 4 + 1] << 8);
+const u32At = (d, o) => ((d[o] | (d[o + 1] << 8) | (d[o + 2] << 16) | (d[o + 3] << 24)) >>> 0);
 
 const nameOf = (kind, id) => {
   const t = kind === KIND.VEHICLE ? VEHICLES : MINIFIGS;
@@ -183,6 +210,7 @@ class LdSession {
     this.link = "disconnected"; this.linkDetail = ""; this.usb = null; this.version = null;
     this.boxes = Array.from({ length: BOXES }, () => ({ kind: 0, id: 0 }));
     this.pending = new Set(); this.parser = new Parser(); this.problem = null; this.lastResult = null;
+    this.tokens = Array(BOXES).fill(null); this.asked = new Set(); this.onToken = () => {}; this.onSavedItem = () => {}; this.onResult = () => {};
     transport.onLink = (s, d) => this.onLinkEvent(s, d);
     transport.onData = (b) => { for (const f of this.parser.feed(b)) this.onFrame(f); this.onChange(); };
     transport.onLog = (m) => this.onLog(m);
@@ -194,7 +222,7 @@ class LdSession {
   onLinkEvent(state, detail) {
     this.link = state; this.linkDetail = detail || "";
     if (state === "connected") { this.usb = null; this.version = null; this.problem = null; this.send(P.hello()); }
-    else { this.pending.clear(); this.usb = null; this.version = null; }
+    else { this.pending.clear(); this.usb = null; this.version = null; this.tokens.fill(null); this.asked.clear(); }
     this.onLog(`link ${state}${detail ? ": " + detail : ""}`); this.onChange();
   }
   requestStatus() { if (this.connected) this.send(P.statusReq()); }
@@ -208,6 +236,23 @@ class LdSession {
     this.onLog(`${nameOf(kind, id)} -> spot ${box + 1}`); this.onChange();
     return [true, `${nameOf(kind, id)} sent to spot ${box + 1}`];
   }
+  placeVehicle(rec, box = null) {
+    if (!this.connected) return [false, "Connect to the Flipper first."];
+    if (this.version !== null && this.version !== VERSION) return [false, this.problem || "Wrong Flipper mode."];
+    if (box === null) box = this.firstFree();
+    if (box < 0) return [false, "All 7 spots are used. Take one off first."];
+    const uid = rec.uid, data = rec.data;
+    if (uid.length !== UID_SIZE || data.length !== DATA_SIZE) return [false, "That saved vehicle is damaged."];
+    this.pending.add(box); this.tokens[box] = { uid, data }; this.asked.delete(box);
+    this.send(P.placeVehicle(box, uid, data));
+    const nm = nameOf(KIND.VEHICLE, vehIdOf(data));
+    this.onLog(`${nm} (saved) -> spot ${box + 1}`); this.onChange();
+    return [true, `${nm} sent to spot ${box + 1} with its saved upgrades`];
+  }
+  requestToken(box) { if (this.connected && !this.asked.has(box)) { this.asked.add(box); this.send(P.get(box)); } }
+  saveToFlipper(box) { if (!this.connected) return false; this.send(P.saveVehicle(box)); return true; }
+  listSaved() { if (!this.connected) return false; this.send(P.savedList()); return true; }
+  readSaved(name) { if (!this.connected) return false; this.send(P.savedRead(name)); return true; }
   remove(box) { if (!this.connected) return false; this.pending.add(box); this.send(P.remove(box)); this.onChange(); return true; }
   clear() { if (!this.connected) return false; this.send(P.clear()); return true; }
   onFrame(f) {
@@ -222,10 +267,26 @@ class LdSession {
       this.problem = null; this.usb = p[1];
       for (let i = 0; i < BOXES; i++) this.boxes[i] = { kind: p[4 + 3 * i], id: p[5 + 3 * i] | (p[6 + 3 * i] << 8) };
       this.pending.clear();
+      /* Vehicles keep their upgrades in their own memory: fetch it once per vehicle on the pad. */
+      for (let i = 0; i < BOXES; i++) {
+        const b = this.boxes[i];
+        if (b.kind !== KIND.VEHICLE) { this.tokens[i] = null; this.asked.delete(i); continue; }
+        const t = this.tokens[i];
+        if ((!t || vehIdOf(t.data) !== b.id) && !this.asked.has(i)) { this.tokens[i] = null; this.requestToken(i); }
+      }
+    } else if (f.type === MSG.TOKEN) {
+      const p = f.payload; if (p.length !== 1 + UID_SIZE + DATA_SIZE) return;
+      const box = p[0], uid = p.slice(1, 1 + UID_SIZE), data = p.slice(1 + UID_SIZE);
+      const asked = box !== BOX_FILE && this.asked.delete(box);
+      if (box < BOXES) this.tokens[box] = { uid, data };
+      this.onToken(box, uid, data, asked);
+    } else if (f.type === MSG.SAVED_ITEM) {
+      this.onSavedItem(f.payload.length ? new TextDecoder().decode(f.payload) : null);
     } else if (f.type === MSG.RESULT) {
       const [req, box, code] = f.payload; this.pending.delete(box);
       this.lastResult = { req, box, code, text: RESULT_TEXT[code] || `code ${code}` };
       if (code) this.onLog(`Flipper: ${this.lastResult.text} (spot ${box + 1})`);
+      this.onResult(this.lastResult);
     }
   }
 }
@@ -334,6 +395,8 @@ function renderStatus() {
   const on = !!(session && session.connected);
   $("bConnect").style.display = on ? "none" : ""; $("bDisconnect").style.display = on ? "" : "none";
   $("bClear").disabled = !on; $("bRemove").disabled = !(on && selected !== null && session.boxes[selected].kind);
+  const vsel = on && selected !== null && session.boxes[selected].kind === KIND.VEHICLE;
+  $("bSaveSel").disabled = !vsel; $("bToFlip").disabled = !vsel; $("bFromFlip").disabled = !on;
 }
 
 function renderList() {
@@ -361,15 +424,154 @@ function placeToken(kind, id) {
   if (ok) selected = null;
   render();
 }
-function render() { drawPad(); renderStatus(); renderList(); }
+function render() { drawPad(); renderStatus(); renderList(); renderLib(); }
+
+
+/* ===== Saved vehicles (the vehicle's own memory: upgrades, levels) ===== */
+const lib = new Map(); // uid hex -> { key, uid, data, id, label, updated }
+let libReady = false, autoKeep = lsGet("ldAutoKeep", true);
+const wantSave = new Set(); // spots the user asked to save
+const fl = { names: [], queue: [], listing: false, reading: null, timer: null, added: 0, total: 0 };
+const mem = { db: null };
+function dbOpen() {
+  return new Promise((res) => {
+    try {
+      const r = indexedDB.open("ldvehicles", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("v", { keyPath: "key" });
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => res(null);
+    } catch (e) { res(null); }
+  });
+}
+async function dbDo(mode, fn) {
+  if (!mem.db) return null;
+  return new Promise((res) => { try { const tx = mem.db.transaction("v", mode); const rq = fn(tx.objectStore("v")); tx.oncomplete = () => res(rq ? rq.result : true); tx.onerror = () => res(null); } catch (e) { res(null); } });
+}
+async function libLoad() {
+  mem.db = await dbOpen();
+  const all = await dbDo("readonly", (st) => st.getAll());
+  if (all) for (const r of all) lib.set(r.key, r);
+  else log("Note: this browser would not open its database; saved vehicles last until you close the page. Use Export.");
+  libReady = true; renderLib();
+}
+const libPut = (r) => { lib.set(r.key, r); dbDo("readwrite", (st) => st.put(r)); };
+const libDel = (k) => { lib.delete(k); dbDo("readwrite", (st) => st.delete(k)); };
+const vehName = (id) => nameOf(KIND.VEHICLE, id).replace(/^\* /, "");
+const vehDisplay = (r) => r.label || vehName(r.id);
+/* Add or update from live data. Returns "new", "updated" or "same". */
+function libUpsert(uid, data, label = "") {
+  const key = hexOf(uid), id = vehIdOf(data), old = lib.get(key), dh = hexOf(data);
+  if (old && hexOf(old.data) === dh) return "same";
+  libPut({ key, uid, data, id, label: old ? old.label : label, updated: Date.now() });
+  return old ? "updated" : "new";
+}
+function onVehicleToken(box, uid, data, asked) {
+  if (box === BOX_FILE) { onFileToken(uid, data); return; }
+  const exists = lib.has(hexOf(uid));
+  const manual = wantSave.delete(box);
+  if (!manual && !exists && !(autoKeep && !asked)) { render(); return; }
+  const r = libUpsert(uid, data);
+  const nm = vehName(vehIdOf(data));
+  if (r === "new") setMsg(`Saved ${nm}${manual ? "" : " (the game changed it)"}.`);
+  else if (r === "updated") setMsg(`Updated ${nm}: its upgrades changed.`);
+  else if (manual) setMsg(`${nm} is already saved, nothing changed.`);
+  renderLib(); render();
+}
+function libPlace(r) {
+  if (!session || !session.connected) return setMsg("Connect to the Flipper first.", true);
+  const [ok, m] = session.placeVehicle(r, selected);
+  setMsg(m, !ok); if (ok) selected = null; render();
+}
+function renderLib() {
+  const el = $("libList"); if (!el) return; el.textContent = "";
+  const rows = [...lib.values()].sort((a, b) => b.updated - a.updated);
+  if (!rows.length) { const p = document.createElement("p"); p.className = "hint"; p.textContent = libReady ? "Nothing saved yet. Put a vehicle on the pad and tap its spot, then Save selected spot (or leave automatic saving on and just play)." : "Loading…"; el.appendChild(p); return; }
+  const onPad = new Set(session ? session.tokens.filter(Boolean).map((t) => hexOf(t.uid)) : []);
+  for (const r of rows) {
+    const row = document.createElement("div"); row.className = "row veh" + (onPad.has(r.key) ? " onp" : "");
+    const th = document.createElement("div"); th.className = "thumb"; th.textContent = (vehName(r.id)[0] || "?").toUpperCase();
+    const t = document.createElement("div"); t.className = "t"; const a = document.createElement("div"); a.textContent = vehDisplay(r);
+    const sm = document.createElement("small"); sm.textContent = `${r.key.slice(2, 10)} · upgrades ${u32At(r.data, 0x23 * 4).toString(16).padStart(8, "0")} ${u32At(r.data, 0x25 * 4).toString(16).padStart(8, "0")} · ${new Date(r.updated).toLocaleDateString()}`;
+    t.append(a, sm);
+    const acts = document.createElement("div"); acts.className = "acts";
+    const ren = document.createElement("button"); ren.textContent = "✎"; ren.title = "Rename";
+    ren.onclick = (e) => { e.stopPropagation(); const v = prompt("Name for this vehicle", vehDisplay(r)); if (v !== null) { libPut({ ...r, label: v.trim() === vehName(r.id) ? "" : v.trim() }); renderLib(); } };
+    const del = document.createElement("button"); del.textContent = "✕"; del.title = "Delete";
+    del.onclick = (e) => { e.stopPropagation(); if (confirm(`Delete saved ${vehDisplay(r)}? Its upgrades cannot be recovered unless you exported them.`)) { libDel(r.key); renderLib(); } };
+    acts.append(ren, del); row.append(th, t, acts); row.onclick = () => libPlace(r); el.appendChild(row);
+  }
+}
+function saveSelected() {
+  if (!session || !session.connected || selected === null || session.boxes[selected].kind !== KIND.VEHICLE) return setMsg("Tap a spot that has a vehicle on it first.", true);
+  wantSave.add(selected); session.asked.delete(selected); session.requestToken(selected); setMsg("Asking the Flipper for the vehicle's memory…");
+}
+function saveOnFlipper() {
+  if (!session || !session.connected || selected === null || session.boxes[selected].kind !== KIND.VEHICLE) return setMsg("Tap a spot that has a vehicle on it first.", true);
+  flipSaveBox = selected; session.saveToFlipper(selected);
+}
+let flipSaveBox = null;
+/* Import every vehicle saved on the Flipper (its own "Saved vehicles" menu). */
+function importFromFlipper() {
+  if (!session || !session.connected) return setMsg("Connect to the Flipper first.", true);
+  if (fl.listing || fl.reading) return;
+  fl.names = []; fl.queue = []; fl.added = 0; fl.listing = true; setMsg("Listing the vehicles saved on the Flipper…");
+  fl.timer = setTimeout(() => { if (fl.listing) flFinishList(); }, 8000);
+  session.listSaved();
+}
+function flFinishList() {
+  clearTimeout(fl.timer); fl.listing = false; fl.queue = fl.names.slice(); fl.total = fl.queue.length;
+  if (!fl.total) return setMsg("The Flipper has no saved vehicles.");
+  flNext();
+}
+function flNext() {
+  clearTimeout(fl.timer);
+  if (!fl.queue.length) { fl.reading = null; setMsg(`Imported ${fl.added} of ${fl.total} saved vehicles from the Flipper.`); renderLib(); return; }
+  fl.reading = fl.queue.shift(); setMsg(`Reading ${fl.total - fl.queue.length} of ${fl.total} from the Flipper…`);
+  fl.timer = setTimeout(flNext, 6000); // a file that never answers is skipped
+  if (!session || !session.readSaved(fl.reading)) { fl.queue = []; flNext(); }
+}
+function onFileToken(uid, data) {
+  if (!fl.reading) return;
+  if (vehIdOf(data) && libUpsert(uid, data) !== "same") fl.added++;
+  flNext();
+}
+function onLdResult(r) {
+  if (r.req === MSG.SAVE_VEHICLE) {
+    if (r.code === 0) setMsg(`Saved on the Flipper (spot ${r.box + 1}). It is in the Flipper's Saved vehicles menu.`);
+    else setMsg("The Flipper could not save that vehicle (is there one on that spot?).", true);
+  } else if (r.req === MSG.SAVED_READ && fl.reading && r.code) flNext();
+  else if (r.req === MSG.GET && r.code) { wantSave.delete(r.box); }
+}
+function exportLib() {
+  const data = { format: "toybox-ld-vehicles", version: 1, vehicles: [...lib.values()].map((r) => ({ uid: hexOf(r.uid), data: hexOf(r.data), label: r.label, updated: r.updated })) };
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: "application/json" }));
+  a.download = "lego-dimensions-vehicles.json"; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+async function importLibFile(file) {
+  try {
+    const j = JSON.parse(await file.text()); if (j.format !== "toybox-ld-vehicles" || !Array.isArray(j.vehicles)) throw new Error("not a vehicle export");
+    let n = 0;
+    for (const v of j.vehicles) {
+      const uid = unhex(String(v.uid || "")), data = unhex(String(v.data || ""));
+      if (uid.length !== UID_SIZE || data.length !== DATA_SIZE || !vehIdOf(data)) continue;
+      const key = hexOf(uid), old = lib.get(key);
+      if (old && old.updated >= (v.updated || 0)) continue; // keep the newer copy
+      libPut({ key, uid, data, id: vehIdOf(data), label: String(v.label || ""), updated: v.updated || Date.now() }); n++;
+    }
+    setMsg(`Imported ${n} vehicle${n === 1 ? "" : "s"}.`); renderLib();
+  } catch (e) { setMsg(`Could not read that file: ${e.message}`, true); }
+}
 
 function startSession() {
   if (session) return;
   session = new LdSession(new WebBleTransport(), log);
   session.onChange = () => {
-    const r = session.lastResult; if (r && r.code) { setMsg(`Flipper: ${r.text}`, true); session.lastResult = null; }
+    const r = session.lastResult; if (r && r.code) { if (![MSG.GET, MSG.SAVED_READ, MSG.SAVE_VEHICLE].includes(r.req)) setMsg(`Flipper: ${r.text}`, true); session.lastResult = null; }
     render();
   };
+  session.onToken = onVehicleToken;
+  session.onResult = onLdResult;
+  session.onSavedItem = (name) => { if (!fl.listing) return; if (name === null) flFinishList(); else if (fl.names.length < 60) fl.names.push(name); };
 }
 $("bConnect").onclick = async () => { startSession(); setMsg(""); await session.transport.connect(); };
 $("bDisconnect").onclick = () => { if (session) session.transport.disconnect(); };
@@ -377,9 +579,14 @@ $("bRemove").onclick = () => { if (session && selected !== null) { session.remov
 $("bClear").onclick = () => { if (session && confirm("Take every token off the pad?")) session.clear(); };
 for (const [id, t] of [["tabMini", "mini"], ["tabVeh", "veh"], ["tabFav", "fav"]]) $(id).onclick = () => { tab = t; for (const [i2, t2] of [["tabMini", "mini"], ["tabVeh", "veh"], ["tabFav", "fav"]]) $(i2).className = t === t2 ? "on" : ""; renderList(); };
 $("q").oninput = renderList;
+$("bSaveSel").onclick = saveSelected; $("bToFlip").onclick = saveOnFlipper; $("bFromFlip").onclick = importFromFlipper;
+$("autoKeep").checked = autoKeep; $("autoKeep").onchange = (e) => { autoKeep = e.target.checked; lsSet("ldAutoKeep", autoKeep); };
+$("bExport").onclick = exportLib; $("bImport").onclick = () => $("fImport").click();
+$("fImport").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importLibFile(f); };
 setInterval(() => { if (session && session.connected) session.requestStatus(); }, 5000); // safety net; the Flipper also pushes changes
 if (!WebBleTransport.supported()) setMsg("This browser has no Web Bluetooth. Use Chrome on Android or desktop (iPhone: the free Bluefy browser).", true);
 render();
+libLoad();
 </script>
 </body>
 </html>
