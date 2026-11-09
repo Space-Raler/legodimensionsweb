@@ -155,9 +155,13 @@ function encode(type, payload = new Uint8Array(0)) {
   return out;
 }
 class Parser {
-  constructor() { this.buf = []; this.bad = 0; }
-  feed(data) {
-    for (const b of data) this.buf.push(b);
+  constructor() { this.buf = []; this.bad = 0; this.t = 0; }
+  feed(data) { this.t = Date.now(); for (const b of data) this.buf.push(b); return this.scan(); }
+  /* A frame that stops half way (a lost Bluetooth packet) would otherwise hold back every frame behind
+   * it, because the parser keeps waiting for bytes that never come. */
+  stale(ms = 1200) { return this.buf.length > 0 && Date.now() - this.t > ms; }
+  flush() { const frames = []; let guard = 0; while (this.buf.length && guard++ < 2048) { this.bad++; this.buf.shift(); frames.push(...this.scan()); } this.buf = []; return frames; }
+  scan() {
     const frames = [];
     for (;;) {
       const start = this.buf.indexOf(SOF);
@@ -219,7 +223,20 @@ class LdSession {
   }
   get connected() { return this.link === "connected"; }
   get ready() { return this.connected && this.version === VERSION && this.usb === 1; }
-  send(frame) { this.transport.send(frame); }
+  send(frame) {
+    this.transport.send(frame);
+    const ty = frame[1];
+    /* The Flipper answers every change with a STATUS, but if that one is lost the page would wait up to 5 s: ask again shortly. */
+    if (ty === MSG.LD_PLACE || ty === MSG.REMOVE || ty === MSG.CLEAR || ty === MSG.PLACE_VEHICLE)
+      for (const ms of [900, 2500]) setTimeout(() => { if (this.connected) this.requestStatus(); }, ms);
+  }
+  tick() {
+    if (!this.parser.stale()) return;
+    const frames = this.parser.flush();
+    this.onLog("A reply from the Flipper arrived incomplete and was skipped.");
+    for (const f of frames) this.onFrame(f);
+    this.onChange();
+  }
   onLinkEvent(state, detail) {
     this.link = state; this.linkDetail = detail || "";
     if (state === "connected") { this.usb = null; this.version = null; this.problem = null; this.send(P.hello()); }
@@ -302,6 +319,8 @@ class LdSession {
       this.problem = null; this.usb = p[1];
       for (let i = 0; i < BOXES; i++) this.boxes[i] = { kind: p[4 + 3 * i], id: p[5 + 3 * i] | (p[6 + 3 * i] << 8) };
       this.pending.clear();
+      const sig = this.boxes.map((b, i) => (b.kind ? `${i + 1}:${b.kind === KIND.VEHICLE ? "vehicle" : "figure"} ${nameOf(b.kind, b.id).replace(/^\* /, "")}` : null)).filter(Boolean).join(", ") || "empty";
+      if (sig !== this.lastSig) { this.lastSig = sig; this.onLog(`Flipper pad: ${sig}`); }
       /* Vehicles keep their upgrades in their own memory: fetch it once per vehicle on the pad. */
       for (let i = 0; i < BOXES; i++) {
         const b = this.boxes[i];
@@ -628,6 +647,7 @@ $("bSaveSel").onclick = saveSelected; $("bToFlip").onclick = saveOnFlipper; $("b
 $("autoKeep").checked = autoKeep; $("autoKeep").onchange = (e) => { autoKeep = e.target.checked; lsSet("ldAutoKeep", autoKeep); };
 $("bExport").onclick = exportLib; $("bImport").onclick = () => $("fImport").click();
 $("fImport").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importLibFile(f); };
+setInterval(() => { if (session) session.tick(); }, 500);
 setInterval(() => { if (session && session.connected) session.requestStatus(); }, 5000); // safety net; the Flipper also pushes changes
 if (!WebBleTransport.supported()) setMsg("This browser has no Web Bluetooth. Use Chrome on Android or desktop (iPhone: the free Bluefy browser).", true);
 render();
